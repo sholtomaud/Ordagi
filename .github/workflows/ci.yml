@@ -1,0 +1,289 @@
+name: OrdAGI CI
+
+# Run on every push and on every PR targeting main or develop.
+# All jobs must pass before a PR can be merged.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel any in-progress run for the same branch when a new push arrives.
+# Prevents queue build-up on rapid-fire commits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 1: Build
+# Compiles the full project with -Werror. If this fails, nothing else runs.
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  build:
+    name: Build (Debian / gcc)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm-slim
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            gcc make \
+            libcjson-dev \
+            libcbor-dev \
+            libgsl-dev \
+            gnuplot-nox \
+            ca-certificates
+          gcc --version
+          make --version
+
+      - name: Build (release flags)
+        run: make release
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ordagi-binaries
+          path: bin/
+          retention-days: 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 2: Unit Tests
+# Runs all fast unit tests. Reports per-test pass/fail in the PR checks panel.
+# ─────────────────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: build
+    container:
+      image: debian:bookworm-slim
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            gcc make \
+            libcjson-dev \
+            libcbor-dev \
+            libgsl-dev
+
+      - name: Bootstrap ontology
+        run: make build && make init-data
+
+      - name: Run unit tests
+        run: make test-unit
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: data/test_results.txt
+          retention-days: 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 3: Mercury Precession Benchmark (Drift Test)
+# Validates Tier 2 IDC drift correction.
+# Target: 42.45 ± 0.5 arcseconds per century.
+# This is the most important single test in the repository.
+# Runs as a separate job so its result is visible as its own PR check.
+# ─────────────────────────────────────────────────────────────────────────────
+  drift-benchmark:
+    name: "Benchmark: Mercury Precession (IDC Tier 2)"
+    runs-on: ubuntu-latest
+    needs: build
+    container:
+      image: debian:bookworm-slim
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            gcc make \
+            libcjson-dev \
+            libcbor-dev \
+            libgsl-dev
+
+      - name: Build
+        run: make build
+
+      - name: Run drift benchmark
+        run: make test-drift
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 4: CBOR Round-Trip Test
+# Writes a known ontology to CBOR, reloads it, and verifies every field.
+# Separate job because CBOR corruption is silent and catastrophic.
+# ─────────────────────────────────────────────────────────────────────────────
+  cbor-roundtrip:
+    name: "CBOR Round-Trip Integrity"
+    runs-on: ubuntu-latest
+    needs: build
+    container:
+      image: debian:bookworm-slim
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            gcc make \
+            libcjson-dev \
+            libcbor-dev \
+            libgsl-dev
+
+      - name: Build
+        run: make build
+
+      - name: Run CBOR round-trip test
+        run: |
+          make build
+          ./bin/ordagi --test-cbor-roundtrip
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 5: Memory Safety (Valgrind)
+# Runs the REPL test scenario under Valgrind.
+# Zero memory errors and zero leaks required.
+# Runs only on PRs to main (slow — ~2 min) to avoid blocking rapid iteration.
+# ─────────────────────────────────────────────────────────────────────────────
+  valgrind:
+    name: "Memory Safety (Valgrind)"
+    runs-on: ubuntu-latest
+    needs: [unit-tests, cbor-roundtrip]
+    # Only run on PRs targeting main — too slow for every push
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    container:
+      image: debian:bookworm-slim
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            gcc make \
+            libcjson-dev \
+            libcbor-dev \
+            libgsl-dev \
+            valgrind
+
+      - name: Build (debug — no optimisation, sanitisers off for valgrind)
+        run: make debug
+
+      - name: Bootstrap ontology
+        run: make init-data
+
+      - name: Run valgrind
+        run: make valgrind
+
+      - name: Upload valgrind report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: valgrind-report
+          path: data/valgrind.log
+          retention-days: 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 6: Static Analysis (cppcheck)
+# Zero warnings policy. Mirrors `make lint` locally.
+# ─────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: "Static Analysis (cppcheck)"
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: sudo apt-get install -y cppcheck
+
+      - name: Run cppcheck
+        run: make lint
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 7: Ontology Integrity
+# Validates that data/ontology.json parses correctly and all interaction
+# inputs reference defined seeds. Catches broken bootstrap configs before
+# they reach the CBOR brain.
+# ─────────────────────────────────────────────────────────────────────────────
+  ontology-lint:
+    name: "Ontology JSON Integrity"
+    runs-on: ubuntu-latest
+    needs: build
+    container:
+      image: debian:bookworm-slim
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            gcc make \
+            libcjson-dev \
+            libcbor-dev \
+            libgsl-dev \
+            python3
+
+      - name: Validate ontology.json structure
+        run: python3 tools/validate_ontology.py data/ontology.json
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Final gate: all required jobs must pass for the PR to be mergeable.
+# Configure this as the required status check in GitHub branch protection.
+# ─────────────────────────────────────────────────────────────────────────────
+  ci-gate:
+    name: "CI Gate (all checks passed)"
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - unit-tests
+      - drift-benchmark
+      - cbor-roundtrip
+      - lint
+      - ontology-lint
+    if: always()
+    steps:
+      - name: Check all required jobs passed
+        run: |
+          echo "build:           ${{ needs.build.result }}"
+          echo "unit-tests:      ${{ needs.unit-tests.result }}"
+          echo "drift-benchmark: ${{ needs.drift-benchmark.result }}"
+          echo "cbor-roundtrip:  ${{ needs.cbor-roundtrip.result }}"
+          echo "lint:            ${{ needs.lint.result }}"
+          echo "ontology-lint:   ${{ needs.ontology-lint.result }}"
+
+          if [[ "${{ needs.build.result }}"           != "success" || \
+                "${{ needs.unit-tests.result }}"      != "success" || \
+                "${{ needs.drift-benchmark.result }}" != "success" || \
+                "${{ needs.cbor-roundtrip.result }}"  != "success" || \
+                "${{ needs.lint.result }}"            != "success" || \
+                "${{ needs.ontology-lint.result }}"   != "success" ]]; then
+            echo "One or more required checks failed. PR cannot be merged."
+            exit 1
+          fi
+
+          echo "All checks passed. PR is ready to merge."
