@@ -1,0 +1,42 @@
+{
+  "seeds": [
+    {
+      "name": "solar energy",
+      "cardinality": 100.0,
+      "quality": 1.0,
+      "aliases": ["sunlight", "solar radiation", "solar input"]
+    },
+    {
+      "name": "carbon dioxide",
+      "cardinality": 20.0,
+      "quality": 1.0,
+      "aliases": ["CO2", "atmospheric carbon"]
+    },
+    {
+      "name": "decomposer",
+      "cardinality": 10.0,
+      "quality": 1.0,
+      "aliases": ["bacteria", "fungi", "decomposers"]
+    }
+  ],
+  "interactions": [
+    {
+      "type": "co-production",
+      "input_A": "solar energy",
+      "input_B": "carbon dioxide",
+      "output": "biomass",
+      "verb": "transforms",
+      "adverb": "photosynthetically",
+      "aliases": ["organic matter", "plant matter"]
+    },
+    {
+      "type": "inter-action",
+      "input_A": "biomass",
+      "input_B": "decomposer",
+      "output": "soil nutrients",
+      "verb": "interacts",
+      "adverb": "biologically",
+      "aliases": ["nutrients", "mineral nutrients"]
+    }
+  ]
+}
